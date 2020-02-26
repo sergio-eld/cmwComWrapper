@@ -25,12 +25,12 @@ COMContext::~COMContext()
 }
 
 
-std::variant<com_ptr<IConnectionPoint>, HRESULT> FindConnectionPoint<void>::Find(IConnectionPointContainer & cpContainer, REFIID riid)
+std::variant<ComPtr<IConnectionPoint>, HRESULT> FindConnectionPoint<void>::Find(IConnectionPointContainer & cpContainer, REFIID riid)
 {
     IConnectionPoint *pCp = nullptr;
     HRESULT hr = cpContainer.FindConnectionPoint(riid, &pCp);
     if (!SUCCEEDED(hr))
         return hr;
 
-    return com_ptr<IConnectionPoint>(pCp);
+    return ComPtr<IConnectionPoint>(pCp);
 }

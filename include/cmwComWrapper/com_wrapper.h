@@ -11,6 +11,9 @@
 #include <combaseapi.h>
 #include <comdef.h>
 
+#undef interface
+#undef max
+
 namespace cmw
 {
     struct COMContext
@@ -21,7 +24,7 @@ namespace cmw
 
     template <typename T, 
         class = std::enable_if_t<std::is_base_of_v<IUnknown, T>>>
-    class com_ptr
+    class ComPtr
     {
         // dummy class, workaround. 
         // Otherwise error due to not being able to inherit from final class 
@@ -38,7 +41,7 @@ namespace cmw
             using IUnknown::Release;
             using IUnknown::QueryInterface;
 
-            friend class com_ptr<T>;
+            friend class ComPtr<T>;
         };
 
         using ptr_type = std::conditional_t<std::is_final_v<T>, T, hide_refs<T>>;
@@ -47,24 +50,24 @@ namespace cmw
 
     public:
 
-        com_ptr()
+        ComPtr()
             : rawPtr_(nullptr)
         {}
 
-        com_ptr(const com_ptr& other)
+        ComPtr(const ComPtr& other)
             : rawPtr_(other.rawPtr_)
         {
             if (IsValid())
                 rawPtr_->AddRef();
         }
 
-        com_ptr(com_ptr&& other)
+        ComPtr(ComPtr&& other)
             : rawPtr_(other.rawPtr_)
         {
             other.rawPtr_ = nullptr;
         }
 
-        com_ptr& operator=(const com_ptr& other)
+        ComPtr& operator=(const ComPtr& other)
         {
             release_if_valid(rawPtr_);
             rawPtr_ = other.rawPtr_;
@@ -73,7 +76,7 @@ namespace cmw
             return *this;
         }
 
-        com_ptr& operator=(com_ptr&& other)
+        ComPtr& operator=(ComPtr&& other)
         {
             release_if_valid(rawPtr_);
             rawPtr_ = other.rawPtr_;
@@ -90,7 +93,7 @@ namespace cmw
         }
 
         // ownership must be transfered to this object
-        com_ptr(T* rawPtr)
+        ComPtr(T* rawPtr)
             : rawPtr_(static_cast<ptr_type*>(rawPtr))
         {
             assert(assert_ptr(rawPtr) && "Invalid raw pointer!");
@@ -107,7 +110,7 @@ namespace cmw
         }
 
         template <typename Q, class = std::enable_if_t<std::is_base_of_v<IUnknown, Q>>>
-        com_ptr(Q *raw_parent)
+        ComPtr(Q *raw_parent)
             : rawPtr_(nullptr)
         {
             HRESULT hr = raw_parent->QueryInterface((T**)&rawPtr_);
@@ -119,7 +122,7 @@ namespace cmw
 
         // TODO: return hresut code, do not throw
         template <typename Q, class = std::enable_if_t<std::is_base_of_v<IUnknown, Q>>>
-        std::variant<com_ptr<Q>, HRESULT> QueryInterface()
+        std::variant<ComPtr<Q>, HRESULT> QueryInterface()
         {
             Q *rawOut = nullptr;
             HRESULT hr = rawPtr_->QueryInterface(__uuidof(Q), (void**)&rawOut);
@@ -128,14 +131,14 @@ namespace cmw
                 return hr;
                 //throw _com_error(hr);
 
-            return com_ptr<Q>(rawOut);
+            return ComPtr<Q>(rawOut);
         }
 
         template <typename Q, class = std::enable_if_t<std::is_base_of_v<IUnknown, Q>>>
-        operator com_ptr<Q>()
+        operator ComPtr<Q>()
         {
-            std::variant<com_ptr<Q>, HRESULT> ret = QueryInterface<Q>();
-            assert(std::holds_alternative<com_ptr<Q>>(ret) && "Failed to query interface!");
+            std::variant<ComPtr<Q>, HRESULT> ret = QueryInterface<Q>();
+            assert(std::holds_alternative<ComPtr<Q>>(ret) && "Failed to query interface!");
             if (std::holds_alternative<HRESULT>(ret))
                 throw _com_error(std::get<1>(ret));
 
@@ -187,7 +190,7 @@ namespace cmw
             return (size_t)refs;
         }
 
-        ~com_ptr()
+        ~ComPtr()
         {
             if (rawPtr_)
                 rawPtr_->Release();
@@ -209,13 +212,81 @@ namespace cmw
         }
     };
 
+
+    template <class Interface, class CoClass, class Dispatch>
+    class ComObj
+    {
+    protected:
+
+        ComPtr<Interface> pInterface_;
+        ComPtr<Dispatch> pDispInterface_;
+
+    public:
+
+        using coclass = CoClass;
+        using interface = Interface;
+        using dispinterface = Dispatch;
+
+        ComObj() = default;
+
+        ComObj(const ComPtr<Interface>& pInterface)
+            : pInterface_(pInerface),
+            pDispInterface_(pInterface_)
+        {}
+
+        operator const ComPtr<Interface>&()
+        {
+            return pInterface_;
+        }
+        operator const ComPtr<Dispatch>&()
+        {
+            return pDispInterface_;
+        }
+
+        HRESULT CreateInstance(tagCLSCTX clsContext, IUnknown *pAggregate = nullptr)
+        {
+            std::variant<ComPtr<Interface>, HRESULT> vInterface =
+                cmw::CreateInstance<Interface, CoClass>(clsContext, pAggregate);
+
+            if (std::holds_alternative<HRESULT>(vInterface))
+                return std::get<HRESULT>(vInterface);
+
+            pInterface_ = std::move(std::get<0>(vInterface));
+            return S_OK;
+        }
+
+        ComObj(tagCLSCTX clsContext,
+            IUnknown * pAggregate = nullptr)
+        {
+            try
+            {
+                pInterface_ = CreateInstance<Interface, CoClass>(clsContext, pAggregate);
+                pDispInterface_ = pInterface_;
+            }
+            catch (const _com_error& error)
+                throw error;
+        }
+
+    private:
+
+        static void check_dispatch()
+        {
+            if constexpr (std::is_same_v<void, Dispatch>)
+                return;
+            else
+                static_assert(std::is_base_of_v<IDispatch, Dispatch>,
+                    "Dispinterface must inherit from IDispatch!");
+        }
+    };
+
+
+
     template <class Interface>
     struct transfer_com_ptr
     {
-#undef interface
 
-        using v_interface = std::variant<com_ptr<Interface>, HRESULT>;
-        using ptr_com = com_ptr<Interface>;
+        using v_interface = std::variant<ComPtr<Interface>, HRESULT>;
+        using ptr_com = ComPtr<Interface>;
 
         v_interface temp_;
 
@@ -245,7 +316,7 @@ namespace cmw
         using transfer = transfer_com_ptr<Interface>;
 
     public:
-        static std::variant<com_ptr<Interface>, HRESULT> Create(tagCLSCTX clsContext,
+        static std::variant<ComPtr<Interface>, HRESULT> Create(tagCLSCTX clsContext,
             IUnknown * pAggregate = nullptr)
         {
             Interface *pRes = nullptr;
@@ -255,7 +326,7 @@ namespace cmw
                 return hr;
 
             assert(pRes && "Interface is nullptr!");
-            return com_ptr<Interface>(pRes);
+            return ComPtr<Interface>(pRes);
         }
 
         CreateInstance(tagCLSCTX clsContext,
@@ -276,7 +347,7 @@ namespace cmw
 
     public:
 
-        static std::variant<com_ptr<IConnectionPoint>, HRESULT>
+        static std::variant<ComPtr<IConnectionPoint>, HRESULT>
             Find(IConnectionPointContainer& cpContainer, REFIID riid);
 
         FindConnectionPoint(IConnectionPointContainer& cpContainer, REFIID riid) noexcept
@@ -301,7 +372,7 @@ namespace cmw
         using base = FindConnectionPoint<void>;
     public:
 
-        static std::variant<com_ptr<IConnectionPoint>, HRESULT>
+        static std::variant<ComPtr<IConnectionPoint>, HRESULT>
             Find(IConnectionPointContainer& cpContainer)
         {
             // TODO: assert __uuidof is not null
@@ -319,7 +390,7 @@ namespace cmw
     class com_connections
     {
         // pointers to IConnectionPoints must be 'Alive' by the moment Unadvise is called 
-        std::map<DWORD, com_ptr<IConnectionPoint>> connections_;
+        std::map<DWORD, ComPtr<IConnectionPoint>> connections_;
 
     public:
 
@@ -328,7 +399,7 @@ namespace cmw
             return connections_.size();
         }
 
-        void RegConnectionPoint(DWORD cookie, com_ptr<IConnectionPoint>& cpoint)
+        void RegConnectionPoint(DWORD cookie, ComPtr<IConnectionPoint>& cpoint)
         {
             connections_.emplace(cookie, cpoint);
         }
@@ -339,7 +410,7 @@ namespace cmw
             if (found == connections_.end())
                 return false;
 
-            com_ptr<IConnectionPoint>& cp = found->second;
+            ComPtr<IConnectionPoint>& cp = found->second;
             HRESULT hr = cp->Unadvise(found->first);
 
             connections_.erase(found);
@@ -357,7 +428,7 @@ namespace cmw
             iter it = connections_.begin();
             while (it != connections_.end())
             {
-                com_ptr<IConnectionPoint>& cp = it->second;
+                ComPtr<IConnectionPoint>& cp = it->second;
                 HRESULT hr = cp->Unadvise(it->first);
                 if (!SUCCEEDED(hr))
                     res = hr;
@@ -424,7 +495,7 @@ namespace cmw
     public:
 
         // does not register dword cookie in Connectible's connections map
-        static std::variant<DWORD, HRESULT> Connect(com_ptr<IUnknown>& pSink,
+        static std::variant<DWORD, HRESULT> Connect(ComPtr<IUnknown>& pSink,
             IConnectionPoint& cpoint)
         {
             DWORD cookie = 0;
@@ -434,10 +505,10 @@ namespace cmw
             return cookie;
         }
 
-        static HRESULT Connect(com_ptr<Connectible>& connectible,
-            com_ptr<IConnectionPoint>& cpoint)
+        static HRESULT Connect(ComPtr<Connectible>& connectible,
+            ComPtr<IConnectionPoint>& cpoint)
         {
-            com_ptr<IUnknown> pSink = connectible;
+            ComPtr<IUnknown> pSink = connectible;
             std::variant<DWORD, HRESULT> vCookie = Connect(pSink, *cpoint);
             if (std::holds_alternative<HRESULT>(vCookie))
                 return std::get<HRESULT>(vCookie);
@@ -447,27 +518,27 @@ namespace cmw
             return S_OK;
         }
 
-        static std::variant<HRESULT, bool> Disconnect(com_ptr<Connectible>& connectible, 
+        static std::variant<HRESULT, bool> Disconnect(ComPtr<Connectible>& connectible, 
             DWORD cookie)
         {
             return connectible->Disconnect(cookie);
         }
 
-        ConnectListener(com_ptr<Connectible>& connectible,
-            com_ptr<IConnectionPoint>& cpoint)
+        ConnectListener(ComPtr<Connectible>& connectible,
+            ComPtr<IConnectionPoint>& cpoint)
             : hr_(Connect(connectible, cpoint))
         {}
 
         // something is wrong. If this method is used, UnAdvise returns "Object is not connected to server"
         template <class Interface, class Provider>
-        ConnectListener(com_ptr<Connectible>& connectible, com_ptr<Provider>& cpProvider, 
+        ConnectListener(ComPtr<Connectible>& connectible, ComPtr<Provider>& cpProvider, 
             tag_iid<Interface>)
         {
             
             try
             {
-                com_ptr<IConnectionPointContainer> cpContainter = cpProvider;
-                com_ptr<IConnectionPoint> cPoint =
+                ComPtr<IConnectionPointContainer> cpContainter = cpProvider;
+                ComPtr<IConnectionPoint> cPoint =
                     FindConnectionPoint<Interface>(*cpContainter);
                 hr_ = Connect(connectible, cPoint);
             }
@@ -486,71 +557,9 @@ namespace cmw
     };
 
 
-    template <class Interface, class CoClass, class Dispatch>
-    class com_obj
-    {
-    protected:
-
-        com_ptr<Interface> pInterface_;
-        com_ptr<Dispatch> pDispInterface_;
-
-    public:
-
-        using coclass = CoClass;
-        using interface = Interface;
-        using dispinterface = Dispatch;
-
-        com_obj() = default;
-
-        com_obj(const com_ptr<Interface>& pInterface)
-            : pInterface_(pInerface),
-            pDispInterface_(pInterface_)
-        {}
-
-        operator const com_ptr<Interface>&()
-        {
-            return pInterface_;
-        }
-        operator const com_ptr<Dispatch>&()
-        {
-            return pDispInterface_;
-        }
-
-        HRESULT CreateInstance(tagCLSCTX clsContext, IUnknown *pAggregate = nullptr)
-        {
-            std::variant<com_ptr<Interface>, HRESULT> vInterface =
-                cmw::CreateInstance<Interface, CoClass>(clsContext, pAggregate);
-            
-            if (std::holds_alternative<HRESULT>(vInterface))
-                return std::get<HRESULT>(vInterface);
-
-            pInterface_ = std::move(std::get<0>(vInterface));
-            return S_OK;
-        }
-
-        com_obj(tagCLSCTX clsContext,
-            IUnknown * pAggregate = nullptr)
-        {
-            try
-            {
-                pInterface_ = CreateInstance<Interface, CoClass>(clsContext, pAggregate);
-                pDispInterface_ = pInterface_;
-            }
-            catch (const _com_error& error)
-                throw error;
-        }
-        
-    private:
-
-        static void check_dispatch()
-        {
-            if constexpr (std::is_same_v<void, Dispatch>)
-                return;
-            else
-                static_assert(std::is_base_of_v<IDispatch, Dispatch>,
-                    "Dispinterface must inherit from IDispatch!");
-        }
-    };
+    /////////////////////////////////////////////////////////////
+    //IUnknown implementation
+    /////////////////////////////////////////////////////////////
 
     // helper class. Implements thread safe reference counting
     class reference_counter
@@ -567,7 +576,6 @@ namespace cmw
         ULONG Release()
         {
             --refs_;
-#undef max
             assert((refs_ != std::numeric_limits<ULONG>::max()) && "Invalid value!");
             return refs_;
         }
@@ -581,9 +589,6 @@ namespace cmw
         ~reference_counter() = default;
 
     };
-
-
-
 
     /*
     template <class COM, class Interface, class Disp>
