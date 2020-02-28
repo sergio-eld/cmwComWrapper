@@ -12,7 +12,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
 
 set(PUBLIC_HEADERS
-	include/${PROJECT_NAME}/com_wrapper.h
+	include/com_wrapper.h
+	include/com_events.h
 	)
 
 
@@ -20,6 +21,7 @@ add_library(${PROJECT_NAME}
 	STATIC
 		${PUBLIC_HEADERS}
 		src/com_wrapper.cpp
+		src/com_events.cpp
 	)
 
 target_include_directories(${PROJECT_NAME}
@@ -35,6 +37,8 @@ set_target_properties(${PROJECT_NAME}
 		OUTPUT_NAME ${PROJECT_NAME}
 		DEBUG_POSTFIX "_d"
 	)
+	
+add_subdirectory(testing)
 	
 # installation
 

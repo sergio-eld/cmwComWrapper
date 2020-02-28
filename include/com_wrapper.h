@@ -1,12 +1,17 @@
 ﻿#pragma once
 
 #include <map>
+#include <set>
+#include <unordered_map>
+
+#include <shared_mutex>
 
 #include <type_traits>
 #include <variant>
 #include <cassert>
 
 #include <atomic>
+#include <functional>
 
 #include <combaseapi.h>
 #include <comdef.h>
@@ -212,6 +217,63 @@ namespace cmw
         }
     };
 
+    template <class Interface>
+    struct transfer_com_ptr
+    {
+
+        using v_interface = std::variant<ComPtr<Interface>, HRESULT>;
+        using ptr_com = ComPtr<Interface>;
+
+        v_interface temp_;
+
+        constexpr transfer_com_ptr(v_interface&& temp)
+            : temp_(std::move(temp))
+        {}
+
+        operator v_interface()
+        {
+            return std::move(temp_);
+        }
+
+        operator ptr_com()
+        {
+            assert(!std::holds_alternative<HRESULT>(temp_) &&
+                "Invalid Connection point received!");
+            if (std::holds_alternative<HRESULT>(temp_))
+                throw _com_error(std::get<HRESULT>(temp_));
+
+            return std::move(std::get<ptr_com>(temp_));
+        }
+    };
+
+    template <class Interface, class CoClass>
+    class CreateInstance : protected transfer_com_ptr<Interface>
+    {
+        using transfer = transfer_com_ptr<Interface>;
+
+    public:
+        static std::variant<ComPtr<Interface>, HRESULT> Create(tagCLSCTX clsContext,
+            IUnknown * pAggregate = nullptr)
+        {
+            Interface *pRes = nullptr;
+            HRESULT hr = CoCreateInstance(__uuidof(CoClass), pAggregate, clsContext,
+                __uuidof(Interface), (void**)&pRes);
+            if (!SUCCEEDED(hr))
+                return hr;
+
+            assert(pRes && "Interface is nullptr!");
+            return ComPtr<Interface>(pRes);
+        }
+
+        CreateInstance(tagCLSCTX clsContext,
+            IUnknown * pAggregate = nullptr) noexcept
+            : transfer(Create(clsContext, pAggregate))
+        {}
+
+        using transfer::operator transfer::v_interface;
+        using transfer::operator transfer::ptr_com;
+
+    };
 
     template <class Interface, class CoClass, class Dispatch>
     class ComObj
@@ -280,66 +342,6 @@ namespace cmw
     };
 
 
-
-    template <class Interface>
-    struct transfer_com_ptr
-    {
-
-        using v_interface = std::variant<ComPtr<Interface>, HRESULT>;
-        using ptr_com = ComPtr<Interface>;
-
-        v_interface temp_;
-
-        transfer_com_ptr(v_interface&& temp)
-            : temp_(std::move(temp))
-        {}
-
-        operator v_interface()
-        {
-            return std::move(temp_);
-        }
-
-        operator ptr_com()
-        {
-            assert(!std::holds_alternative<HRESULT>(temp_) &&
-                "Invalid Connection point received!");
-            if (std::holds_alternative<HRESULT>(temp_))
-                throw _com_error(std::get<HRESULT>(temp_));
-
-            return std::move(std::get<ptr_com>(temp_));
-        }
-    };
-
-    template <class Interface, class CoClass>
-    class CreateInstance : protected transfer_com_ptr<Interface>
-    {
-        using transfer = transfer_com_ptr<Interface>;
-
-    public:
-        static std::variant<ComPtr<Interface>, HRESULT> Create(tagCLSCTX clsContext,
-            IUnknown * pAggregate = nullptr)
-        {
-            Interface *pRes = nullptr;
-            HRESULT hr = CoCreateInstance(__uuidof(CoClass), pAggregate, clsContext,
-                __uuidof(Interface), (void**)&pRes);
-            if (!SUCCEEDED(hr))
-                return hr;
-
-            assert(pRes && "Interface is nullptr!");
-            return ComPtr<Interface>(pRes);
-        }
-
-        CreateInstance(tagCLSCTX clsContext,
-            IUnknown * pAggregate = nullptr) noexcept
-            : transfer(Create(clsContext, pAggregate))
-        {}
-
-        using transfer::operator transfer::v_interface;
-        using transfer::operator transfer::ptr_com;
-
-    };
-
-
     template <class Interface = void, bool = std::is_void_v<Interface>>
     class FindConnectionPoint : protected transfer_com_ptr<IConnectionPoint>
     {
@@ -385,8 +387,37 @@ namespace cmw
 
     };
     
+    // helper class. Implements thread safe reference counting
+    class reference_counter
+    {
+        std::atomic<ULONG> refs_ = 1;
+
+    public:
+        ULONG AddRef()
+        {
+            ++refs_;
+            return refs_;
+        }
+
+        ULONG Release()
+        {
+            --refs_;
+            assert((refs_ != std::numeric_limits<ULONG>::max()) && "Invalid value!");
+            return refs_;
+        }
+
+        ULONG RefsCount() const
+        {
+            return refs_;
+        }
+
+        constexpr reference_counter() = default;
+        ~reference_counter() = default;
+
+    };
+
     // this class implements multiple connections for a com object. 
-    // Connectible object may inherit from it to provide RegConnectionPoint 
+    // Connectible object may inherit from it to provide RegConnection 
     class com_connections
     {
         // pointers to IConnectionPoints must be 'Alive' by the moment Unadvise is called 
@@ -399,7 +430,7 @@ namespace cmw
             return connections_.size();
         }
 
-        void RegConnectionPoint(DWORD cookie, ComPtr<IConnectionPoint>& cpoint)
+        void RegConnection(DWORD cookie, ComPtr<IConnectionPoint>& cpoint)
         {
             connections_.emplace(cookie, cpoint);
         }
@@ -448,6 +479,8 @@ namespace cmw
 
     };
 
+
+
     template <class Dispatch>
     class listener_traits
     {
@@ -459,7 +492,7 @@ namespace cmw
 
         template<class T>
         struct has_reg_cpoint<T,
-            std::void_t<decltype(t_reg_cpoint(&T::RegConnectionPoint))>> :
+            std::void_t<decltype(t_reg_cpoint(&T::RegConnection))>> :
             std::true_type {};
 
         template <class T, class = std::void_t<>>
@@ -477,7 +510,7 @@ namespace cmw
         constexpr static bool has_reg_cpoint_v = has_reg_cpoint<Dispatch>();
         constexpr static bool has_disconnect_v = has_disconnect<Dispatch>();
 
-        constexpr static bool is_connectible = inherit_idispatch &&
+        constexpr static bool is_connectible = //inherit_idispatch &&
             has_reg_cpoint_v &&
             has_disconnect_v;
 
@@ -513,7 +546,7 @@ namespace cmw
             if (std::holds_alternative<HRESULT>(vCookie))
                 return std::get<HRESULT>(vCookie);
 
-            connectible->RegConnectionPoint(std::get<DWORD>(vCookie), cpoint);
+            connectible->RegConnection(std::get<DWORD>(vCookie), cpoint);
 
             return S_OK;
         }
@@ -557,38 +590,272 @@ namespace cmw
     };
 
 
-    /////////////////////////////////////////////////////////////
-    //IUnknown implementation
-    /////////////////////////////////////////////////////////////
-
-    // helper class. Implements thread safe reference counting
-    class reference_counter
+    enum class disp_inv_args : size_t
     {
-        std::atomic<ULONG> refs_ = 1;
+        dispIDMember = 0,
+        riid,
+        locale,
+        wFlags,
+        pDispParams,
+        pVarResult,
+        pExcepInfo,
+        puArgErr
+    };
+
+    using disp_inv_t = HRESULT(DISPID, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*);
+
+    template <typename T>
+    struct disp_arg_indx : std::integral_constant<size_t, std::numeric_limits<size_t>::max()> {};
+
+    template <> 
+    struct disp_arg_indx<DISPID> : std::integral_constant<size_t, (size_t)disp_inv_args::dispIDMember> {};
+    template <>
+    struct disp_arg_indx<REFIID> : std::integral_constant<size_t, (size_t)disp_inv_args::riid> {};
+    template <>
+    struct disp_arg_indx<LCID> : std::integral_constant<size_t, (size_t)disp_inv_args::locale> {};
+    template <>
+    struct disp_arg_indx<WORD> : std::integral_constant<size_t, (size_t)disp_inv_args::wFlags> {};
+    template <>
+    struct disp_arg_indx<DISPPARAMS*> : std::integral_constant<size_t, (size_t)disp_inv_args::pDispParams> {};
+    template <>
+    struct disp_arg_indx<VARIANT*> : std::integral_constant<size_t, (size_t)disp_inv_args::pVarResult> {};
+    template <>
+    struct disp_arg_indx<EXCEPINFO*> : std::integral_constant<size_t, (size_t)disp_inv_args::pExcepInfo> {};
+    template <>
+    struct disp_arg_indx<UINT*> : std::integral_constant<size_t, (size_t)disp_inv_args::puArgErr> {};
+
+    template <typename T>
+    constexpr inline size_t disp_arg_indx_v = disp_arg_indx<T>();
+
+    template <typename ... A>
+    class reduce_disp_inv_args
+    {
+        std::function<disp_inv_t> reduced_;
+
+        template <size_t ... arg_i>
+        constexpr static std::function<disp_inv_t> reduce_args(std::function<HRESULT(A...)>&& f,
+            std::index_sequence<arg_i...>)
+        {
+            static_assert(((arg_i != disp_arg_indx<void>()) && ...),
+                "Callback function contains invalid arguement types!");
+
+            return std::function<disp_inv_t>(
+                [f = std::move(f)](DISPID dispIDMember,
+                    REFIID riid, LCID lcid, WORD wFlags,
+                    DISPPARAMS *pDispParams, VARIANT *pVarResult,
+                    EXCEPINFO *pExcepInfo, UINT *puArgErr)
+            {
+                // tuple of default args collection
+                auto fwd = std::tie(dispIDMember, riid, lcid,
+                    wFlags, pDispParams,
+                    pVarResult, pExcepInfo, puArgErr);
+
+                return f(std::get<arg_i>(fwd)...);
+            });
+        }
+
+        reduce_disp_inv_args() = delete;
+        reduce_disp_inv_args(const reduce_disp_inv_args&) = delete;
+        reduce_disp_inv_args(reduce_disp_inv_args&&) = delete;
 
     public:
-        ULONG AddRef()
+        constexpr reduce_disp_inv_args(std::function<HRESULT(A...)>&& callback)
+            : reduced_(reduce_args(std::move(callback),
+                std::index_sequence<disp_arg_indx_v<A>...>()))
+        {}
+
+        constexpr operator std::function<disp_inv_t>()
         {
-            ++refs_;
-            return refs_;
+            return std::move(reduced_);
+        }
+    };
+
+    template <auto ptr, typename = decltype(ptr)>
+    struct function_traits;
+    
+    template <auto ptr, typename R, typename ... Args>
+    struct function_traits<ptr, R(*)(Args...)>
+    {
+        constexpr static size_t args_count = sizeof...(Args);
+        using type = R(Args...);
+    };
+
+    template <auto ptr, typename R, typename C, typename ... Args>
+    struct function_traits<ptr, R(C::*)(Args...)>
+    {
+        constexpr static size_t args_count = sizeof...(Args);
+        using type = R(Args...);
+    };
+
+    template <auto ptr>
+    constexpr inline size_t fn_args_count_v = function_traits<ptr>::args_count;
+
+    template <auto ptr>
+    using fn_invoke_t = typename function_traits<ptr>::type;
+
+    template <size_t i>
+    struct pholder{};
+
+    template <size_t i>
+    struct std::is_placeholder<pholder<i>> : public std::integral_constant<int, i + 1>{};
+   
+    template <typename R, typename ... Args>
+    class bind_function
+    {
+        std::function<R(Args...)> bound_;
+
+        template <size_t ... arg_i>
+        constexpr static std::function<R(Args...)> Bind(R(*ptr)(Args...), std::index_sequence<arg_i...>)
+        {
+            return std::bind(ptr, pholder<arg_i>()...);
         }
 
-        ULONG Release()
+        template <class T, size_t ... arg_i>
+        constexpr static std::function<R(Args...)> Bind(T* obj, R(T::*ptr)(Args...), std::index_sequence<arg_i...>)
         {
-            --refs_;
-            assert((refs_ != std::numeric_limits<ULONG>::max()) && "Invalid value!");
-            return refs_;
+            return std::bind(ptr, obj, pholder<arg_i>()...);
         }
 
-        ULONG RefsCount() const
-        {
-            return refs_;
-        }
+    public:
+        constexpr bind_function(R(*ptr)(Args...))
+            : bound_(Bind(ptr, std::make_index_sequence<sizeof...(Args)>()))
+        {}
 
-        constexpr reference_counter() = default;
-        ~reference_counter() = default;
+        template <class T>
+        constexpr bind_function(T* obj, R(T::*ptr)(Args...))
+            : bound_(Bind(obj, ptr, std::make_index_sequence<sizeof...(Args)>()))
+        {}
+
+        constexpr operator std::function<R(Args...)>()
+        {
+            return std::move(bound_);
+        }
+    };
+
+    // default implementation has one-to-one interface connection 
+    class Listener : public IDispatch
+    {
+        // destroy last to keep track of references till the end
+        reference_counter refCounter_;
+        IID connectionIID_;
+
+        // must be destroyed after connections
+        //std::unordered_map<DISPID, std::unique_ptr<idisp_callback>> callbackMap_;
+        std::unordered_map<DISPID, std::function<disp_inv_t>> callbackMap_;
+        com_connections connections_;
+
+        std::shared_mutex mutexMap_;
+
+    public:
+
+        // object address must be unique
+        Listener(const Listener&) = delete;
+        Listener(Listener&&) = delete;
+
+        // RAII. Terminate connections on destruction
+        static std::unique_ptr<Listener> Create(REFIID connectionIID);
+
+        // IConnectible
+
+        virtual REFIID Interface(size_t n = 0) const;
+        virtual size_t NumInterfaces() const;
+
+        virtual void SetCallback(DISPID dispiid, std::function<disp_inv_t>&& callback,
+                REFIID = IID());
+
+        size_t NumConnections() const;
+        void RegConnection(DWORD cookie, ComPtr<IConnectionPoint>& cpoint);
+        std::variant<HRESULT, bool> Disconnect(DWORD cookie);
+        HRESULT DisconnectAll();
+
+        // IUnknown
+
+        ULONG __stdcall AddRef(void) override;
+        ULONG __stdcall Release(void) override;
+
+        // default implementation
+        virtual HRESULT __stdcall QueryInterface(REFIID riid, void ** ppvObject) override;
+
+        // IDispatch
+
+        virtual HRESULT __stdcall Invoke(DISPID dispIdMember, 
+            REFIID riid, LCID lcid, WORD wFlags, 
+            DISPPARAMS * pDispParams, 
+            VARIANT * pVarResult, EXCEPINFO * pExcepInfo, 
+            UINT * puArgErr) override;
+
+        virtual ~Listener() = default;
+
+    protected:
+
+        Listener(REFIID connectionIID)
+            : connectionIID_(connectionIID)
+        {}
+
+        // these methods are not implemented
+        virtual HRESULT __stdcall GetTypeInfoCount(UINT * pctinfo) override;
+        virtual HRESULT __stdcall GetIDsOfNames(REFIID riid, LPOLESTR * rgszNames,
+            UINT cNames, LCID lcid, DISPID * rgDispId) override;
+        virtual HRESULT __stdcall GetTypeInfo(UINT iTInfo, LCID lcid, ITypeInfo ** ppTInfo) override;
+
 
     };
+
+
+    // TODO: make Listener a template parameter?
+    class RegisterCallback
+    {
+        static void Register(Listener& listener, DISPID dispIDMember,
+            std::function<disp_inv_t>&& callback)
+        {
+            listener.SetCallback(dispIDMember, std::move(callback));
+        }
+
+    public:
+
+        RegisterCallback(Listener& listener, DISPID dispIDMember,
+            std::function<disp_inv_t>&& callback)
+        {
+            Register(listener, dispIDMember, std::move(callback));
+        }
+
+        template <typename ... A>
+        RegisterCallback(Listener& listener, DISPID dispIDMember,
+            std::function<HRESULT(A...)>&& callback)
+            : RegisterCallback(listener, dispIDMember,
+                reduce_disp_inv_args(std::move(callback)))
+        {
+        }
+
+        template <typename ... A>
+        RegisterCallback(Listener& listener, DISPID dispIDMember,
+            HRESULT(*pCallback)(A...))
+            : RegisterCallback(listener, dispIDMember, 
+            (std::function<HRESULT(A...)>)bind_function(pCallback))
+            // why doesn't this work?
+            //: RegisterCallback(listener, dispIDMember, 
+            //    reduce_disp_inv_args(bind_function(pCallback)))
+        {
+        }
+
+        template <class T, typename ... A>
+        RegisterCallback(Listener& listener, DISPID dispIDMember, T *pObj,
+            HRESULT(T::*pCallback)(A...))
+            : RegisterCallback(listener, dispIDMember,
+            (std::function<HRESULT(A...)>)bind_function(pObj, pCallback))
+           // : RegisterCallback(listener, dispIDMember, 
+           //     reduce_disp_inv_args(bind_function(pObj, pCallback)))
+        {
+        }
+
+    };
+
+
+    /*
+    // TODO: implement
+    class ListenerMultiple : public Listener
+    {
+    };*/
 
     /*
     template <class COM, class Interface, class Disp>
